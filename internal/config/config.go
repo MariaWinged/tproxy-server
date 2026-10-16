@@ -291,9 +291,6 @@ func (c Config) validate() error {
 	if err := ValidateBasePath(c.BasePath); err != nil {
 		return fmt.Errorf("base_path: %w", err)
 	}
-	if err := validateLoopbackAddress(c.Listen); err != nil {
-		return fmt.Errorf("listen: %w", err)
-	}
 	if err := validateLoopbackAddress(c.AdminListen); err != nil {
 		return fmt.Errorf("admin_listen: %w", err)
 	}
