@@ -9,7 +9,9 @@ import (
 	"io"
 	"math"
 	"net"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/telegramdesktop/tproxy-server/internal/config"
@@ -100,6 +102,8 @@ func newCarrierLane() *carrierLane {
 }
 
 type Session struct {
+	debug    bool
+	debugID  uint64
 	profile  *config.Profile
 	clientIP string
 	limits   config.Limits
@@ -147,6 +151,8 @@ type Session struct {
 func newSession(options sessionOptions) *Session {
 	carrier := options.profile.CarrierMode.WithDefault()
 	result := &Session{
+		debug:                 os.Getenv("TPROXY_WEB_DEBUG") == "1",
+		debugID:               diagnosticIDs.Add(1),
 		profile:               options.profile,
 		clientIP:              options.clientIP,
 		limits:                options.limits,
@@ -172,6 +178,7 @@ func newSession(options sessionOptions) *Session {
 	if carrier == config.CarrierHTTPSLanes {
 		result.carrierLanes[0] = newCarrierLane()
 	}
+	result.trace("session_open", "")
 	return result
 }
 
@@ -235,6 +242,7 @@ func (s *Session) ReleaseWebSocketLane(laneID uint32) {
 		delete(s.streams, laneID)
 		s.rememberClosedLocked(laneID)
 		backend = state.backend
+		backend.reason("carrier_lane_released")
 	}
 	s.releaseLaneLocked(lane)
 	delete(s.carrierLanes, laneID)
@@ -245,7 +253,8 @@ func (s *Session) ReleaseWebSocketLane(laneID uint32) {
 	}
 }
 
-func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
+func (s *Session) ProcessUp(sequence uint64, body []byte) (ack uint64, resultErr error) {
+	defer func() { s.traceTransfer("up", 0, sequence, ack, len(body), resultErr) }()
 	if s.usesCarrierLanes() {
 		return 0, ErrProtocol
 	}
@@ -334,7 +343,8 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	return sequence, nil
 }
 
-func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (uint64, error) {
+func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ack uint64, resultErr error) {
+	defer func() { s.traceTransfer("up", laneID, sequence, ack, len(body), resultErr) }()
 	if !s.usesCarrierLanes() || laneID > frame.MaxStreamID {
 		return 0, ErrProtocol
 	}
@@ -443,7 +453,8 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 	return sequence, nil
 }
 
-func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, error) {
+func (s *Session) Poll(ctx context.Context, cursor uint64) (body []byte, nextCursor uint64, resultErr error) {
+	defer func() { s.traceTransfer("down", 0, cursor, nextCursor, len(body), resultErr) }()
 	if s.usesCarrierLanes() {
 		return nil, cursor, ErrProtocol
 	}
@@ -555,7 +566,8 @@ func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, erro
 	}
 }
 
-func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([]byte, uint64, bool, error) {
+func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) (body []byte, nextCursor uint64, laneClosed bool, resultErr error) {
+	defer func() { s.traceTransfer("down", laneID, cursor, nextCursor, len(body), resultErr) }()
 	if !s.usesCarrierLanes() || laneID > frame.MaxStreamID {
 		return nil, cursor, false, ErrProtocol
 	}
@@ -823,6 +835,7 @@ func (s *Session) applyBatchLocked(
 	opened := make([]*backendStream, 0)
 	closed := make([]*backendStream, 0)
 	for _, value := range values {
+		s.traceFrame("client_to_relay", value.Type, value.StreamID, value.Payload, true)
 		if value.StreamID == 0 {
 			continue
 		}
@@ -832,6 +845,7 @@ func (s *Session) applyBatchLocked(
 		case frame.Open:
 			if len(s.streams) >= s.limits.MaxStreamsPerSession ||
 				(s.acquireStream != nil && !s.acquireStream()) {
+				s.traceStream(value.StreamID, "stream_rejected", "stream_limit")
 				s.rememberClosedLocked(value.StreamID)
 				if s.onStreamRejected != nil {
 					s.onStreamRejected()
@@ -850,6 +864,7 @@ func (s *Session) applyBatchLocked(
 				writeNotify:   make(chan struct{}, 1),
 			}
 			s.streams[value.StreamID] = state
+			s.traceStream(value.StreamID, "stream_open", "client_open")
 			opened = append(opened, backend)
 		case frame.Data:
 			if wasClosed {
@@ -877,6 +892,7 @@ func (s *Session) applyBatchLocked(
 			s.releaseStreamWritesLocked(state)
 			delete(s.streams, value.StreamID)
 			s.rememberClosedLocked(value.StreamID)
+			state.backend.reason("client_close")
 			closed = append(closed, state.backend)
 		}
 	}
@@ -1032,7 +1048,8 @@ func (s *Session) backendClosed(id uint32, backend *backendStream) {
 	backend.close()
 }
 
-func (s *Session) queueFrameLocked(t frame.Type, id uint32, payload []byte) bool {
+func (s *Session) queueFrameLocked(t frame.Type, id uint32, payload []byte) (ok bool) {
+	defer func() { s.traceFrame("relay_to_client_queue", t, id, payload, ok) }()
 	if s.usesCarrierLanes() {
 		return s.queueLaneFrameLocked(t, id, payload)
 	}
@@ -1254,9 +1271,11 @@ func (s *Session) reservePendingLocked(
 		costLimit, itemLimit = s.downlinkPendingLimits()
 	}
 	if cost <= 0 || items < 0 || cost > costLimit || items > itemLimit || s.pendingCost > costLimit-cost || s.pendingItems > itemLimit-items {
+		s.trace("queue_rejected", "scope=session")
 		return false
 	}
 	if s.budget != nil && !s.budget(cost, items, class) {
+		s.trace("queue_rejected", "scope=global")
 		return false
 	}
 	s.pendingCost += cost
@@ -1399,12 +1418,14 @@ func (s *Session) releasePendingLocked(cost, items int) {
 }
 
 func (s *Session) protocolFailure() {
+	s.trace("protocol_failure", "")
 	s.mu.Lock()
 	s.closeLocked()
 	s.mu.Unlock()
 }
 
 func (s *Session) laneProtocolFailure(laneID uint32) {
+	s.traceStream(laneID, "protocol_failure", "invalid_lane_frames")
 	if s.carrier == config.CarrierWebSocketLanes {
 		s.ReleaseWebSocketLane(laneID)
 	} else {
@@ -1416,6 +1437,7 @@ func (s *Session) closeLocked() {
 	if s.closed {
 		return
 	}
+	s.trace("session_close", "")
 	s.closed = true
 	close(s.done)
 	for _, lane := range s.carrierLanes {
@@ -1427,6 +1449,7 @@ func (s *Session) closeLocked() {
 		signal(lane.notify)
 	}
 	for _, value := range s.streams {
+		value.backend.reason("session_closed")
 		value.backend.close()
 	}
 	s.streams = nil
@@ -1472,15 +1495,18 @@ func signal(channel chan struct{}) {
 }
 
 type backendStream struct {
-	session   *Session
-	id        uint32
-	address   string
-	ctx       context.Context
-	cancel    context.CancelFunc
-	connMu    sync.Mutex
-	conn      net.Conn
-	closeOnce sync.Once
-	finished  chan struct{}
+	bytesUp    atomic.Uint64
+	bytesDown  atomic.Uint64
+	reasonOnce sync.Once
+	session    *Session
+	id         uint32
+	address    string
+	ctx        context.Context
+	cancel     context.CancelFunc
+	connMu     sync.Mutex
+	conn       net.Conn
+	closeOnce  sync.Once
+	finished   chan struct{}
 }
 
 func newBackendStream(session *Session, id uint32, address string) *backendStream {
@@ -1497,14 +1523,20 @@ func newBackendStream(session *Session, id uint32, address string) *backendStrea
 
 func (s *backendStream) run() {
 	defer close(s.finished)
-	defer s.session.backendClosed(s.id, s)
+	defer func() {
+		s.session.backendClosed(s.id, s)
+		s.reason("stream_finished")
+		s.session.traceStreamTotals(s.id, s.bytesUp.Load(), s.bytesDown.Load())
+	}()
 
 	dialer := net.Dialer{Timeout: s.session.timeouts.BackendDial.Value()}
 	connection, err := dialer.DialContext(s.ctx, "tcp", s.address)
 	s.session.backendDialFinished(err != nil && s.ctx.Err() == nil)
 	if err != nil {
+		s.reason("dial_" + diagnosticError(err))
 		return
 	}
+	s.session.traceStream(s.id, "backend_connected", "dial_ok")
 	s.connMu.Lock()
 	if s.ctx.Err() != nil {
 		s.connMu.Unlock()
@@ -1534,16 +1566,24 @@ func (s *backendStream) writeLoop(connection net.Conn) {
 		for len(data) != 0 {
 			written, err := connection.Write(data)
 			if written > 0 {
+				s.bytesUp.Add(uint64(written))
 				if !s.session.backendDrained(s.id, written) {
+					s.reason("backend_drain_rejected")
 					return
 				}
 				data = data[written:]
 			}
 			if err != nil || written == 0 {
+				if err == nil {
+					s.reason("write_no_progress")
+				} else {
+					s.reason("write_" + diagnosticError(err))
+				}
 				return
 			}
 		}
 		if !s.session.backendWriteFinished(s.id) {
+			s.reason("write_queue_finished_rejected")
 			return
 		}
 	}
@@ -1557,16 +1597,22 @@ func (s *backendStream) readLoop(connection net.Conn) {
 			return
 		}
 		read, err := connection.Read(buffer[:allowance])
+		if read > 0 {
+			s.bytesDown.Add(uint64(read))
+		}
 		if read > 0 && !s.session.backendData(s.id, buffer[:read]) {
+			s.reason("down_queue_rejected")
 			return
 		}
 		if err != nil {
+			s.reason("read_" + diagnosticError(err))
 			if !errors.Is(err, io.EOF) && s.ctx.Err() == nil {
 				return
 			}
 			return
 		}
 		if read == 0 {
+			s.reason("read_no_progress")
 			return
 		}
 	}

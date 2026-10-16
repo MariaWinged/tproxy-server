@@ -300,6 +300,7 @@ func (s *Server) serveUp(w http.ResponseWriter, r *http.Request, token string) {
 	}
 	body, err := readBody(w, r, s.config.Limits.MaxBodyBytes)
 	if err != nil {
+		value.DiagnosticTransportError("up_read", err)
 		s.serveNotFound(w, r)
 		return
 	}
@@ -406,7 +407,9 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
+	if _, writeErr := w.Write(body); writeErr != nil {
+		value.DiagnosticTransportError("down_write", writeErr)
+	}
 }
 
 func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -522,6 +525,7 @@ func (s *Server) readWebSocket(
 	for {
 		messageType, body, err := connection.ReadMessage()
 		if err != nil {
+			value.DiagnosticTransportError("websocket_io", err)
 			finished <- err
 			return
 		}
@@ -587,6 +591,7 @@ func (s *Server) writeWebSocket(
 			body, next, err = value.Poll(ctx, cursor)
 		}
 		if err != nil {
+			value.DiagnosticTransportError("websocket_io", err)
 			finished <- err
 			return
 		}
@@ -595,17 +600,20 @@ func (s *Server) writeWebSocket(
 			return
 		}
 		if err := connection.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+			value.DiagnosticTransportError("websocket_io", err)
 			finished <- err
 			return
 		}
 		if len(body) == 0 {
 			if err := connection.WriteMessage(websocket.PingMessage, nil); err != nil {
+				value.DiagnosticTransportError("websocket_io", err)
 				finished <- err
 				return
 			}
 			continue
 		}
 		if err := connection.WriteMessage(websocket.BinaryMessage, body); err != nil {
+			value.DiagnosticTransportError("websocket_io", err)
 			finished <- err
 			return
 		}
@@ -620,10 +628,10 @@ func (s *Server) clientIP(r *http.Request) (string, error) {
 	}
 	peer := net.ParseIP(host)
 	if !s.isTrusted(peer) {
-        return "", errors.New(
-            "request did not arrive through trusted proxy",
-        )
-    }
+		return "", errors.New(
+			"request did not arrive through trusted proxy",
+		)
+	}
 
 	forwarded := r.Header.Get("X-Forwarded-For")
 	if forwarded == "" {
@@ -640,33 +648,33 @@ func (s *Server) clientIP(r *http.Request) (string, error) {
 }
 
 func (s *Server) isTrusted(peer net.IP) bool {
-    if peer == nil {
-        return false
-    }
-    if peer.IsLoopback() {
-        return true
-    }
+	if peer == nil {
+		return false
+	}
+	if peer.IsLoopback() {
+		return true
+	}
 
-    for _, entry := range s.config.TrustedProxyIPs {
-        if !strings.Contains(entry, "/") {
-            allowed := net.ParseIP(entry)
-            if allowed != nil && peer.Equal(allowed) {
-                return true
-            }
-            continue
-        }
+	for _, entry := range s.config.TrustedProxyIPs {
+		if !strings.Contains(entry, "/") {
+			allowed := net.ParseIP(entry)
+			if allowed != nil && peer.Equal(allowed) {
+				return true
+			}
+			continue
+		}
 
-        _, network, err := net.ParseCIDR(entry)
-        if err != nil {
-            continue
-        }
+		_, network, err := net.ParseCIDR(entry)
+		if err != nil {
+			continue
+		}
 
-        if network.Contains(peer) {
-            return true
-        }
-    }
+		if network.Contains(peer) {
+			return true
+		}
+	}
 
-    return false
+	return false
 }
 
 // The request reaches the site with its original path, base prefix included. A

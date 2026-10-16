@@ -720,3 +720,31 @@ when overriding the defaults.
 
 The complete architecture and implementation milestones remain in `PLAN.md`; the
 normative wire format is in `PROTOCOL.md`.
+
+### WEB proxy diagnostics
+
+Diagnostics are disabled by default. Set `TPROXY_WEB_DEBUG=1` in the server
+process environment and restart to enable; unset it or set `0` and restart
+to disable. For systemd create a dedicated drop-in:
+
+```ini
+# /etc/systemd/system/tproxy-server.service.d/web-debug.conf
+[Service]
+Environment=TPROXY_WEB_DEBUG=1
+```
+
+Run `systemctl daemon-reload && systemctl restart tproxy-server`, then
+`journalctl -u tproxy-server -f -o cat`.
+
+Events have `event=web_debug`, a process-local numeric session ID, and stream/lane
+IDs. They cover stream creation, first close cause, backend EOF/RST, classified
+I/O errors, queue rejection, DATA/WINDOW/CLOSE, and up/down results with cursors.
+Frame events describe incoming batch application or outgoing queue operations
+(including coalescing), not TCP packets. Replayed up batches are not applied twice.
+`stream_finished` totals count actual bytes written to/read from the backend;
+backend reads do not prove delivery to the client. A client CLOSE carries no
+additional reason in this protocol. Reset classification identifies a backend
+socket reset, not its original cause elsewhere in the network.
+
+Logs exclude payload contents, tokens, secrets, URLs, addresses, profile names,
+and raw error text. Debug frame logging can be high volume; disable after capture.
