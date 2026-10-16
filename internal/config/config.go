@@ -115,6 +115,7 @@ type Config struct {
 	BasePath         string    `json:"base_path"`
 	Listen           string    `json:"listen"`
 	AdminListen      string    `json:"admin_listen"`
+	TrustedProxyIPs  []string  `json:"trusted_proxy_ips"`
 	PublicDir        string    `json:"public_dir"`
 	PublicUpstream   string    `json:"public_upstream"`
 	StaticRoutes     string    `json:"static_routes"`
@@ -297,6 +298,9 @@ func (c Config) validate() error {
 	if c.Listen == c.AdminListen {
 		return errors.New("listen and admin_listen must differ")
 	}
+	if err := validateTrustedProxyIPs(c.TrustedProxyIPs); err != nil {
+        return fmt.Errorf("trusted_proxy_ips: %w", err)
+    }
 	if (c.PublicDir == "") == (c.PublicUpstream == "") {
 		return errors.New("exactly one of public_dir or public_upstream is required")
 	}
@@ -636,4 +640,36 @@ func isSystemdCredential(path string) bool {
 		return false
 	}
 	return filepath.Dir(absolute) == filepath.Clean(directory)
+}
+
+func validateTrustedProxyIPs(entries []string) error {
+    for _, entry := range entries {
+        if entry == "" {
+            return errors.New("empty trusted proxy IP")
+        }
+
+        if entry != strings.TrimSpace(entry) {
+            return fmt.Errorf(
+                "trusted proxy IP has whitespace: %q", entry,
+            )
+        }
+
+        if strings.Contains(entry, "/") {
+            if _, _, err := net.ParseCIDR(entry); err != nil {
+                return fmt.Errorf(
+                    "invalid trusted proxy CIDR %q: %w",
+                    entry, err,
+                )
+            }
+            continue
+        }
+
+        if net.ParseIP(entry) == nil {
+            return fmt.Errorf(
+                "invalid trusted proxy IP %q", entry,
+            )
+        }
+    }
+
+    return nil
 }
