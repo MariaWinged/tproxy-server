@@ -1005,6 +1005,11 @@ func (s *Session) nextReadAllowance(id uint32, done <-chan struct{}) (int, bool)
 				return result, true
 			}
 		}
+		reason := "budget"
+		if state.sendCredit == 0 {
+			reason = "credit"
+		}
+		s.traceReadStateLocked(id, "backend_read_wait", reason, 0, 0, true)
 		notify := state.creditNotify
 		budgetNotify := s.budgetNotify
 		s.mu.Unlock()
@@ -1019,10 +1024,11 @@ func (s *Session) nextReadAllowance(id uint32, done <-chan struct{}) (int, bool)
 	}
 }
 
-func (s *Session) backendData(id uint32, data []byte) bool {
+func (s *Session) backendData(id uint32, data []byte) (ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state := s.streams[id]
+	defer func() { s.traceReadStateLocked(id, "backend_data_queue", "queue_attempt", len(data), 0, ok) }()
 	if s.closed || state == nil || len(data) == 0 || uint64(len(data)) > state.sendCredit {
 		return false
 	}
@@ -1540,6 +1546,7 @@ func (s *backendStream) run() {
 	s.connMu.Lock()
 	if s.ctx.Err() != nil {
 		s.connMu.Unlock()
+		s.session.traceStream(s.id, "backend_close", "canceled_before_install")
 		_ = connection.Close()
 		return
 	}
@@ -1590,29 +1597,37 @@ func (s *backendStream) writeLoop(connection net.Conn) {
 }
 
 func (s *backendStream) readLoop(connection net.Conn) {
+	stopReason := "allowance_stopped"
+	s.session.traceStream(s.id, "backend_reader_start", "connected")
+	defer func() { s.session.traceStream(s.id, "backend_reader_stop", stopReason) }()
 	buffer := make([]byte, frame.DataChunk)
 	for {
 		allowance, ok := s.session.nextReadAllowance(s.id, s.ctx.Done())
 		if !ok {
 			return
 		}
+		s.session.traceReadState(s.id, "backend_read_begin", "allowed", 0, allowance, true)
 		read, err := connection.Read(buffer[:allowance])
+		s.session.traceReadState(s.id, "backend_read_end", diagnosticError(err), read, allowance, true)
 		if read > 0 {
 			s.bytesDown.Add(uint64(read))
 		}
 		if read > 0 && !s.session.backendData(s.id, buffer[:read]) {
-			s.reason("down_queue_rejected")
+			stopReason = "down_queue_rejected"
+			s.reason(stopReason)
 			return
 		}
 		if err != nil {
-			s.reason("read_" + diagnosticError(err))
+			stopReason = "read_" + diagnosticError(err)
+			s.reason(stopReason)
 			if !errors.Is(err, io.EOF) && s.ctx.Err() == nil {
 				return
 			}
 			return
 		}
 		if read == 0 {
-			s.reason("read_no_progress")
+			stopReason = "read_no_progress"
+			s.reason(stopReason)
 			return
 		}
 	}
@@ -1623,7 +1638,9 @@ func (s *backendStream) close() {
 		s.cancel()
 		s.connMu.Lock()
 		if s.conn != nil {
-			_ = s.conn.Close()
+			s.session.traceStream(s.id, "backend_close_begin", "stream_shutdown")
+			err := s.conn.Close()
+			s.session.traceStream(s.id, "backend_close_end", diagnosticError(err))
 			s.conn = nil
 		}
 		s.connMu.Unlock()

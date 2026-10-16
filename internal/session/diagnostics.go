@@ -108,3 +108,26 @@ func (s *Session) DiagnosticTransportError(operation string, err error) {
 	}
 	s.trace(operation, "result="+diagnosticError(err))
 }
+
+// traceReadStateLocked requires session.mu and must not acquire connMu.
+func (s *Session) traceReadStateLocked(id uint32, event, reason string, n, allowance int, accepted bool) {
+	if !s.debug {
+		return
+	}
+	state := s.streams[id]
+	var credit uint64
+	if state != nil {
+		credit = state.sendCredit
+	}
+	costLimit, itemLimit := s.downlinkPendingLimits()
+	s.trace(event, fmt.Sprintf("stream=%d reason=%s bytes=%d allowance=%d accepted=%t stream_present=%t session_closed=%t send_credit=%d pending_cost=%d pending_items=%d down_cost_limit=%d down_item_limit=%d", id, reason, n, allowance, accepted, state != nil, s.closed, credit, s.pendingCost, s.pendingItems, costLimit, itemLimit))
+}
+
+func (s *Session) traceReadState(id uint32, event, reason string, n, allowance int, accepted bool) {
+	if !s.debug {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.traceReadStateLocked(id, event, reason, n, allowance, accepted)
+}
