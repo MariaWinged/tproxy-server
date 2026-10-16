@@ -619,9 +619,12 @@ func (s *Server) clientIP(r *http.Request) (string, error) {
 		return "", err
 	}
 	peer := net.ParseIP(host)
-	if peer == nil || !peer.IsLoopback() {
-		return "", errors.New("request did not arrive through loopback proxy")
-	}
+	if !s.isTrusted(peer) {
+        return "", errors.New(
+            "request did not arrive through trusted proxy",
+        )
+    }
+
 	forwarded := r.Header.Get("X-Forwarded-For")
 	if forwarded == "" {
 		return peer.String(), nil
@@ -634,6 +637,36 @@ func (s *Server) clientIP(r *http.Request) (string, error) {
 		return "", errors.New("invalid forwarding address")
 	}
 	return parsed.String(), nil
+}
+
+func (s *Server) isTrusted(peer net.IP) bool {
+    if peer == nil {
+        return false
+    }
+    if peer.IsLoopback() {
+        return true
+    }
+
+    for _, entry := range s.config.TrustedProxyIPs {
+        if !strings.Contains(entry, "/") {
+            allowed := net.ParseIP(entry)
+            if allowed != nil && peer.Equal(allowed) {
+                return true
+            }
+            continue
+        }
+
+        _, network, err := net.ParseCIDR(entry)
+        if err != nil {
+            continue
+        }
+
+        if network.Contains(peer) {
+            return true
+        }
+    }
+
+    return false
 }
 
 // The request reaches the site with its original path, base prefix included. A
